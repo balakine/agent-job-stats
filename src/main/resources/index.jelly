@@ -1,0 +1,6 @@
+<?jelly escape-by-default='true'?>
+<div>
+  Streams Jenkins build and executor events over HTTP as newline-delimited
+  JSON, resumable after a dropped connection, so a client can see which agents
+  a build occupied and for how long.
+</div>
