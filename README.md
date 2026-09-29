@@ -1,17 +1,15 @@
 # agent-events
 
-A small Jenkins plugin that streams build and **executor allocation** events
-over HTTP, resumable after a dropped connection. One subscription tells the
-whole story of a build: queued, started, which agents it took, when each gave
-its executor back, and the final result.
+A small Jenkins plugin that records build and **executor allocation** events in
+a local SQLite database and streams them over HTTP, resumable after a dropped
+connection. One subscription tells the whole story of a build: started, which
+agents it took, when each gave its executor back, and the final result.
 
 ```json
-{"seq":1,"event":"build_started","at":1790230560347,"job":"mixed-pipeline","url":"job/mixed-pipeline/16/","build":16}
-{"seq":2,"event":"executor_allocated","at":1790230561419,"job":"mixed-pipeline","build":16,"node":"lab-agent","executor":0,"task":"part of mixed-pipeline #16"}
-{"seq":3,"event":"executor_allocated","at":1790230561421,"job":"mixed-pipeline","build":16,"node":"built-in","executor":0,"task":"part of mixed-pipeline #16"}
-{"seq":4,"event":"executor_released","at":1790230566821,"job":"mixed-pipeline","build":16,"node":"built-in","executor":0,"outcome":"completed","duration_ms":5414}
-{"seq":5,"event":"executor_released","at":1790230575792,"job":"mixed-pipeline","build":16,"node":"lab-agent","executor":0,"outcome":"completed","duration_ms":14396}
-{"seq":6,"event":"build_ended","at":1790230576172,"job":"mixed-pipeline","build":16,"status":"FAILURE"}
+{"seq":1,"event":"build_started","at":1790230560347,"job":"mixed-pipeline","job_id":"7bc2f917-…","url":"job/mixed-pipeline/16/","build":16}
+{"seq":2,"event":"executor_allocated","at":1790230561419,"job":"mixed-pipeline","job_id":"7bc2f917-…","url":"job/mixed-pipeline/16/","build":16,"node":"lab-agent","node_id":"48b0ea38-…","executor":0,"task":"part of mixed-pipeline #16"}
+{"seq":3,"event":"executor_released","at":1790230575792,"job":"mixed-pipeline","job_id":"7bc2f917-…","url":"job/mixed-pipeline/16/","build":16,"node":"lab-agent","node_id":"48b0ea38-…","executor":0,"task":"part of mixed-pipeline #16","outcome":"completed","duration_ms":14396}
+{"seq":4,"event":"build_ended","at":1790230576172,"job":"mixed-pipeline","job_id":"7bc2f917-…","url":"job/mixed-pipeline/16/","build":16,"status":"FAILURE"}
 ```
 
 ## Why it exists
@@ -20,12 +18,11 @@ Jenkins publishes no event when an executor is taken or handed back. It will
 tell you a build left the queue `ALLOCATED` - an executor was assigned - but
 never *which* one, so the only ways to learn where a build ran are polling
 `/computer/api/json` while it runs or reading the log afterwards. Neither works
-for watching a fleet live.
+for watching a fleet live, and neither leaves a record to analyse later.
 
-The stream also has to survive a dropped connection. Every event carries a
-sequence number and a bounded backlog is kept, so a client reconnects with
-`?since=<last seq>` and is sent exactly what it missed rather than silently
-skipping it.
+Jenkins also has no stable identity for a job or an agent, only a name, and
+names change. The plugin gives each one an id that survives renames and moves,
+so history about a job is still about that job after it is renamed.
 
 ## The events
 
@@ -39,40 +36,36 @@ happened; a property appears only when it carries something the name does not.
 | `executor_allocated` | an executor took up work | `ExecutorListener` |
 | `executor_released` | it handed the work back | `ExecutorListener` |
 
-Jenkins also offers listeners for queue movement and for job configuration.
-Neither is used: a queue item that never becomes a build is not a build, and a
-configuration change is not activity. The cost is that a build cancelled while
-still queued produces no events at all - it never became a build - and that
-creating or deleting a job is invisible. Adding either back is one small
-listener if the need appears.
+Queue movement is not recorded: a queue item that never becomes a build is not a
+build, so a build cancelled while still queued leaves no trace.
 
 Properties, all optional except `seq`, `event` and `at`:
 
 | property | meaning |
 | --- | --- |
-| `seq` | position in the log; what a reconnect resumes from |
+| `seq` | position in the record; what a reconnect resumes from |
 | `event` | what happened |
 | `at` | when Jenkins says it happened, epoch milliseconds |
-| `job` | full job name |
-| `url` | path to the job or build, relative to the Jenkins root |
+| `job` | full job name, as it is now |
+| `job_id` | the job's stable id |
+| `url` | path to the build, relative to the Jenkins root; absent once the job is deleted |
 | `build` | build number |
 | `status` | the build's result, on `build_ended` only |
-| `node` | agent the executor belongs to; `built-in` for Jenkins itself |
+| `node` | agent the executor belongs to, as it is named now; `built-in` for Jenkins itself |
+| `node_id` | the agent's stable id |
 | `executor` | executor number on that node |
 | `task` | what the executor is working on, as Jenkins names it |
 | `outcome` | `completed` or `problems`, on `executor_released` |
 | `duration_ms` | how long the executor held the work |
 | `problem` | the failure Jenkins reported, when there was one |
-| `node_hidden` | set when `node` was withheld for lack of permission |
+| `node_hidden` | set when the agent was withheld for lack of permission |
 
 `at`, `build`, `executor` and `duration_ms` are JSON numbers; the rest are
 strings.
 
-## The two events this plugin adds
-
-
-Both go into the same log as the build events, so one stream carries the whole
-story in order, and each is gated on `Item.READ` for the job it belongs to.
+Names are resolved when an event is *read*, not when it happened: replaying a
+build from before a rename shows the job under its new name and `url`. `job_id`
+and `node_id` are what to key on.
 
 `node` is the agent's own name, so it matches what you would write in
 `node('lab-agent')`; Jenkins's built-in node has no name and reports as
@@ -80,12 +73,12 @@ story in order, and each is gated on `Item.READ` for the job it belongs to.
 
 ## What `outcome` means, and what it does not
 
-Everything published here comes from `ExecutorListener`, which knows nothing
-about what kind of job it is serving. That is deliberate: one meaning for every
-event whatever ran - a Pipeline `node` block, a freestyle build, a matrix
-configuration, or anything else that occupies an executor.
+`ExecutorListener` knows nothing about what kind of job it is serving. That is
+deliberate: one meaning for every event whatever ran - a Pipeline `node` block,
+a freestyle build, a matrix configuration, or anything else that occupies an
+executor.
 
-`ExecutorListener` distinguishes exactly two endings, and so does this plugin:
+It distinguishes exactly two endings, and so does this plugin:
 
 * `completed` - the task came back with no error raised
 * `problems` - Jenkins reported a `Throwable` for the task, summarized in
@@ -103,27 +96,99 @@ release the executor at all (a Pipeline `node` block waits for the agent to
 reconnect), and aborting released it as `completed`. It is implemented from the
 listener's contract rather than from an observed case.
 
-## Pairing a release with its allocation
+## What is tracked
 
-A build can occupy two executors on the same agent - two parallel Pipeline
-branches, say. `node` alone is then ambiguous, so both events also carry
-`executor`; the pair (`node`, `executor`) is one executor slot. Verified with two branches on one agent: allocations on
-`lab-agent#0` and `lab-agent#1`, releases on the same two.
+* **Static agents and the built-in node only.** Work on an ephemeral agent - an
+  `EphemeralNode` or a cloud agent (`AbstractCloudSlave`) - is not recorded:
+  such agents come and go by the thousand and would fill the nodes table with
+  names that are never seen again. The build itself is still recorded; only its
+  allocations there are not.
+* **Flyweight executors are skipped.** A Pipeline's own task sits on a
+  flyweight executor for the whole run, occupying no agent capacity. Its
+  lifetime is the build's lifetime, which `build_started` and `build_ended`
+  already report.
+* **Pairing a release with its allocation.** A build can occupy two executors
+  on the same agent - two parallel Pipeline branches, say - so both events
+  carry `executor`; the pair (`node`, `executor`) is one executor slot.
+* **Nothing before installation.** There is no backfill from existing build
+  history.
 
-## Flyweight executors are skipped
+## Storage
 
-A Pipeline's own task sits on a flyweight executor for the whole run, occupying
-no agent capacity. Its lifetime is the build's lifetime, which `build_started`
-and `build_ended` already report, so publishing it would duplicate every
-build.
+Everything lives in `$JENKINS_HOME/agent-events/events.db`, an SQLite database
+bundled with the plugin (xerial `sqlite-jdbc`, which is why the `.hpi` is 12 MB:
+it carries native libraries for every platform Jenkins runs on). There is no
+in-memory copy of events: the stream reads the same rows the listeners write.
+
+| table | one row per |
+| --- | --- |
+| `jobs` | job ever seen: `id` (UUID), current `full_name`, `deleted_at` |
+| `nodes` | static agent ever seen: `id` (UUID), current `name`, `deleted_at` |
+| `builds` | build: job, number, start and end times, result |
+| `allocations` | executor a build occupied: node, executor number, task, allocation and release times, outcome, duration, problem |
+| `meta`, `sequence` | epoch, last sequence number issued |
+
+An event is not stored twice. Each row carries the sequence numbers of the
+changes it went through (`started_seq` and `ended_seq` on a build,
+`allocated_seq` and `released_seq` on an allocation), and "events after N" is a
+query over those columns.
+
+**Identity follows Jenkins.** An id is minted the first time a job or agent is
+seen and kept through:
+
+* a job rename or move between folders, including everything inside a renamed
+  or moved folder (`ItemListener.onLocationChanged`)
+* an agent rename (`NodeListener.onUpdated`)
+
+Deleting a job or agent marks it `deleted_at` and keeps its history. If a new
+job is later created under the same name, it is a different job with a new id.
+
+**Writes are synchronous**, inside the listener callback, on one connection in
+WAL mode. There is no queue, so there is nothing to lose on a crash and no
+second representation of an event waiting to be written. Measured on the lab
+(eMMC storage, the slowest disk likely to host a Jenkins):
+
+| write | p50 | p99 | max |
+| --- | --- | --- | --- |
+| build started | 0.30 ms | 4.0 ms | 54 ms |
+| executor allocated | 0.34 ms | 2.7 ms | 65 ms |
+| executor released | 0.28 ms | 2.8 ms | 58 ms |
+| build ended | 0.28 ms | 0.9 ms | 52 ms |
+
+The tail is SQLite checkpointing the WAL. Eight threads writing flat out managed
+about 1250 writes a second between them. A write that fails is logged and
+dropped; it never fails the build.
+
+**Retention** is off: at a few hundred bytes a row, most instances can keep
+everything. To keep only recent history, start Jenkins with
+
+```
+-Dcom.varjo.jenkins.agentevents.Store.retentionDays=90
+```
+
+Once a day, builds older than that are deleted along with their allocations.
+The property is read on every run, so it can be changed from the script console
+without a restart. Jobs and agents are never pruned.
+
+Readers need nothing but the plugin: the stream is the interface, and the
+database file is an implementation detail that may change between versions.
+
+**The schema is versioned.** Each version is a migration script in
+`src/main/resources/com/varjo/jenkins/agentevents/schema/`: `1.sql` creates the
+initial schema, and each later `n.sql` takes a database from version `n - 1` to
+`n`. The version a database is at is its `PRAGMA user_version`. On startup the
+plugin runs every script the database has not had yet, in order, each in the
+same transaction as the version bump, so a failed migration leaves the file as
+it was. A database written by a newer plugin is refused rather than guessed at,
+which makes a downgrade fail loudly instead of corrupting history.
+
+A script that has shipped is never edited. A schema change is a new script plus
+a bump of `Store.SCHEMA_VERSION`.
 
 ## The stream
 
-The recent history of Jenkins activity is kept in memory, numbered, and served
-as newline-delimited JSON:
-
 ```
-GET /agent-events/stream            everything still retained, then live
+GET /agent-events/stream            everything stored, then live
 GET /agent-events/stream?since=417  everything after 417, then live
 ```
 
@@ -135,38 +200,31 @@ keepalives, every 15 seconds. Two control lines:
 {"type":"gap","requested_since":9,"oldest_available":57}
 ```
 
-`hello` opens every stream. `gap` says the record is incomplete - either the
-requested sequence has fallen out of the backlog, or the reader fell too far
-behind - so a client learns it missed something instead of quietly missing it.
+`hello` opens every stream. `gap` says the record is incomplete - the requested
+sequence has been pruned - so a client learns it missed something instead of
+quietly missing it. A reader that falls behind is simply behind: it catches up
+from the database, and nothing is buffered for it.
 
-**`epoch` matters.** Sequence numbers live in memory, so a Jenkins restart
-starts them over. A client holding cursor 400 would otherwise ask for "events
-after 400" forever and skip the new 1..400. The epoch changes on restart, which
-tells the client to drop its cursor; the server also notices `since > latest`
-and answers with a gap plus whatever it still holds.
-
-Capacity is 2000 events, or `-Dcom.varjo.jenkins.agentevents.EventLog.capacity=N`.
-A reader that falls more than 1000 events behind
-(`...EventLog.readerBacklog=N`) is sent a gap and disconnected rather than
-allowed to consume memory.
+History survives a Jenkins restart, and so does the numbering: a client that
+reconnects after a restart resumes from its cursor with nothing missed.
+**`epoch`** identifies the database, and changes only if it is deleted and
+recreated. A client that sees a new epoch drops its cursor; the server also
+notices `since > latest` and answers with a gap followed by everything it has.
 
 ### Who may see what
 
-Filtering happens per reader, in the reading user's own authentication - which
-is the thing a published bus cannot do, because a message there carries one ACL
-and is dispatched whole or not at all - no way to vary per reader which fields
-they may see.
+Filtering happens per reader, in the reading user's own authentication.
 
 * **`Item.READ` on the job** - without it the event is not sent at all.
-* **`Computer.EXTENDED_READ` on the agent** - without it `node` and `executor`
-  are removed and `node_hidden` is set, so the reader
-  still learns that an executor was taken, just not where.
+* **`Computer.EXTENDED_READ` on the agent** - without it `node`, `node_id` and
+  `executor` are removed and `node_hidden` is set, so the reader still learns
+  that an executor was taken, just not where.
+* **Deleted jobs and agents** can no longer be checked, so only administrators
+  see them: failing closed is the only safe way to be wrong about a permission.
 
 Jenkins core has no per-agent read permission (`Computer` defines CONFIGURE,
 EXTENDED_READ, DELETE, CREATE, DISCONNECT, CONNECT, BUILD and nothing finer), so
-EXTENDED_READ is the closest thing to "may see this agent's details". An agent
-that no longer exists cannot be checked and is hidden: failing closed is the only
-safe way to be wrong about a permission.
+EXTENDED_READ is the closest thing to "may see this agent's details".
 
 Verified with two accounts on the same replay - `admin`, and a `watcher` holding
 `Item.READ` but no permission on any agent:
@@ -197,16 +255,17 @@ of browser clients.
 
 ## What it logs
 
-Almost nothing, and nothing at all unless you ask. The plugin writes no files:
-the event log is memory only.
+Nothing at all unless something goes wrong or you ask.
 
 | Level | When |
 | --- | --- |
-| `FINE` | a client opened a stream: which user, which cursor, how much is being replayed |
+| `FINE` | a client opened a stream: which user, which cursor |
 | `FINE` | that stream closed: how long it lasted, how many events it received |
-| `FINE` | once at startup, that the log is listening on the `job` channel |
-| `WARNING` | a reader was disconnected for falling behind - it lost events, so it is said out loud |
-| `WARNING` | an event could not be published to the bus |
+| `FINE` | retention pruned old builds |
+| `INFO` | the database was created or migrated, once per schema version |
+| `WARNING` | an event, rename or deletion could not be written - it is missing from the record |
+| `WARNING` | a stream could not read the database |
+| `WARNING` | the database could not be opened or migrated; nothing is recorded until Jenkins restarts |
 
 Client traffic is `FINE` rather than `INFO` because a client reconnects on every
 network blip and the system log is read at `INFO`. To follow clients, add a
@@ -214,17 +273,17 @@ logger for `com.varjo.jenkins.agentevents` at `FINE` in *Manage Jenkins > System
 Log*:
 
 ```
-FINE  c.v.j.a.StreamRootAction#doStream: stream opened for admin (since=none, replaying 0)
+FINE  c.v.j.a.StreamRootAction#doStream: stream opened for admin (since=0)
 FINE  c.v.j.a.StreamRootAction#doStream: stream closed for admin after 54s, 9 events sent
 ```
 
 Two details worth knowing. `?probe=1` requests - which is how a client asks
 whether this endpoint exists at all - get the `hello` line and nothing else: no
-reader attached, no stream held, no log entry, because it is not really a
-connection. And a client that dies without closing its socket is reaped within
-about two keepalive intervals, roughly 30 seconds: a one-byte keepalive to a
-dead peer is buffered locally, so the failure only surfaces on the write after
-that. Each live stream holds one request thread until then.
+stream held, no log entry, because it is not really a connection. And a client
+that dies without closing its socket is reaped within about two keepalive
+intervals, roughly 30 seconds: a one-byte keepalive to a dead peer is buffered
+locally, so the failure only surfaces on the write after that. Each live stream
+holds one request thread until then.
 
 ## Build and install
 
@@ -236,11 +295,25 @@ Then *Manage Jenkins > Plugins > Advanced > Deploy Plugin*, or drop the `.hpi`
 into `$JENKINS_HOME/plugins/`. A fresh install needs no restart; replacing a
 loaded version does.
 
-**No plugin dependencies** - `Plugin-Dependencies` is absent from the manifest
-and everything comes from Jenkins core. Built against Jenkins 2.528.1, two LTS
-lines below ci-sandbox, so it loads there and on anything newer.
+**No plugin dependencies** - `Plugin-Dependencies` is absent from the manifest.
+Everything comes from Jenkins core except SQLite, which is bundled inside the
+`.hpi`. Built against Jenkins 2.528.1, two LTS lines below ci-sandbox, so it
+loads there and on anything newer.
 
-Verified on Jenkins 2.568.3 against a real inbound agent, for: a Pipeline across
-two different agents, two parallel branches on one agent (distinguished by
-`executor`), freestyle builds that pass and fail, an aborted build, replay across a disconnect, replay across a Jenkins
-restart, and the agent-name gate with two accounts.
+Verified on Jenkins 2.568.3 against real inbound agents, for:
+
+* a Pipeline across two different agents, two parallel branches on one agent
+  (told apart by `executor`), freestyle builds that pass and fail, an aborted
+  build
+* the same job id through a rename, a move into a folder and a rename of that
+  folder, with replay showing the new `url`; the same agent id through a rename
+  and back
+* a deleted job: marked deleted, its builds kept, visible to `admin` only
+* a Pipeline split across an ephemeral agent and a static one: the static
+  allocation recorded, the ephemeral one not, and the ephemeral agent never
+  added to `nodes`
+* a client connected across a Jenkins restart: same epoch, history intact,
+  reconnect with no gap
+* pruning: allocations deleted with their builds, and a reader asking for a
+  pruned range sent a `gap`
+* the agent-name gate with two accounts

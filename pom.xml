@@ -16,7 +16,7 @@
   <version>1.0.0</version>
   <packaging>hpi</packaging>
   <name>Agent Events</name>
-  <description>Streams build and executor events over HTTP, resumable by sequence number.</description>
+  <description>Records build and executor events in SQLite and streams them over HTTP, resumable by sequence number.</description>
 
   <licenses>
     <license>
@@ -29,6 +29,10 @@
     <!-- Two LTS lines below ci-sandbox (2.568.2) so the plugin is not pinned to
          the newest core; a plugin loads on any core at or above its baseline. -->
     <jenkins.version>2.528.1</jenkins.version>
+    <!-- The one bundled library. Strict, so anything else being bundled fails
+         the build instead of shipping unnoticed. -->
+    <hpi.bundledArtifacts>sqlite-jdbc</hpi.bundledArtifacts>
+    <hpi.strictBundledArtifacts>true</hpi.strictBundledArtifacts>
   </properties>
 
   <repositories>
@@ -44,5 +48,19 @@
     </pluginRepository>
   </pluginRepositories>
 
-  <!-- No plugin dependencies: everything comes from Jenkins core. -->
+  <!-- No plugin dependencies: everything else comes from Jenkins core. -->
+  <dependencies>
+    <dependency>
+      <groupId>org.xerial</groupId>
+      <artifactId>sqlite-jdbc</artifactId>
+      <version>3.53.4.0</version>
+      <exclusions>
+        <!-- Jenkins core provides SLF4J; a second copy would shadow it. -->
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+  </dependencies>
 </project>

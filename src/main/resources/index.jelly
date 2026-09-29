@@ -1,6 +1,7 @@
 <?jelly escape-by-default='true'?>
 <div>
-  Streams Jenkins build and executor events over HTTP as newline-delimited
-  JSON, resumable after a dropped connection, so a client can see which agents
-  a build occupied and for how long.
+  Records Jenkins build and executor events in a local SQLite database and
+  streams them over HTTP as newline-delimited JSON, resumable after a dropped
+  connection, so a client can see which agents a build occupied and for how
+  long. Jobs and agents keep a stable id through renames and moves.
 </div>
