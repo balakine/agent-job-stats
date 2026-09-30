@@ -10,12 +10,9 @@ import java.util.logging.Logger;
 import jenkins.model.NodeListener;
 
 /**
- * Keeps stored identities attached to the jobs and nodes they belong to.
- *
- * <p>Jenkins names things rather than identifying them, so a rename or a move
- * would otherwise start a new history. These listeners update the stored name
- * behind each minted id. A rename made while the plugin is not running is
- * missed, and the job's next build starts a new id under its new name.
+ * Updates the stored name behind each job and node id on rename, move and
+ * deletion. A rename made while the plugin is not running is missed: the job's
+ * next build gets a new id under the new name.
  */
 final class IdentityEvents {
 

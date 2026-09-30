@@ -26,25 +26,22 @@ import org.sqlite.SQLiteDataSource;
  * The plugin's only record of what happened: an SQLite database at
  * {@code JENKINS_HOME/agent-events/events.db}.
  *
- * <p>There is no in-memory copy of events. Listeners write their rows inside
- * their own callback, and the stream reads the same rows back. What stands in
- * for an event log is a sequence number stamped on each row as it changes:
- * {@code started_seq} and {@code ended_seq} on a build, {@code allocated_seq}
- * and {@code released_seq} on an allocation. Reading everything after a cursor
- * is a query across those columns, so an event exists in exactly one place.
+ * <p>Listeners write rows inside their callback, and the stream reads the same
+ * rows. Each row carries the sequence numbers of its changes: {@code started_seq}
+ * and {@code ended_seq} on a build, {@code allocated_seq} and
+ * {@code released_seq} on an allocation. The events after a cursor are a query
+ * across those columns.
  *
- * <p>Jobs and nodes get a minted UUID the first time they are seen, and keep it
- * through renames and moves, because this table follows them: Jenkins itself
- * has no stable identity for either, only a name.
+ * <p>Jobs and nodes get a UUID when first seen and keep it through renames and
+ * moves; Jenkins has no stable identity for either.
  *
- * <p>Writes are synchronous and serialized on one connection. SQLite in WAL
- * mode commits in well under a millisecond, which is cheap enough to pay on a
- * listener thread and buys a store with no queue in front of it. Readers get
- * their own connections, which WAL lets run alongside the writer.
+ * <p>Writes are synchronous, on the listener's thread, serialized on one
+ * connection. Readers use their own connections, which WAL runs concurrently
+ * with the writer.
  *
- * <p>The database is opened when Jenkins first looks this extension up. If
- * that fails the extension is not loaded, the failure is in the system log,
- * and every listener logs a warning instead of recording.
+ * <p>The database is opened when Jenkins first looks this extension up. If that
+ * fails, the extension is not loaded, the cause is in the system log, and each
+ * listener logs a warning.
  */
 @Extension
 public class Store {
@@ -57,7 +54,7 @@ public class Store {
      * database is at is its {@code PRAGMA user_version}. A script that has
      * shipped is never edited: a change is a new script and a bump here.
      */
-    private static final int SCHEMA_VERSION = 1;
+    private static final int SCHEMA_VERSION = 2;
 
     /** One change, as the stream shows it: a build or an allocation at one sequence number. */
     record Row(
@@ -103,7 +100,7 @@ public class Store {
             UNION ALL
             SELECT * FROM (
                 SELECT a.released_seq, 'executor_released', a.released_at, b.job_id, b.number,
-                       NULL, a.node_id, a.executor, a.task, a.outcome, a.duration_ms, a.problem
+                       NULL, a.node_id, a.executor, a.task, a.outcome, a.released_at - a.allocated_at, a.problem
                 FROM allocations a JOIN builds b ON b.id = a.build_id
                 WHERE a.released_seq > ?1 ORDER BY a.released_seq LIMIT ?2)
         ) e
@@ -126,8 +123,8 @@ public class Store {
     private final String epoch;
 
     /**
-     * The newest sequence number, mirrored from the {@code sequence} table so
-     * waiting readers can be woken without querying. A number, not an event.
+     * The newest committed sequence number, mirrored from the {@code sequence}
+     * table so waiting readers can be woken without querying.
      */
     private volatile long latest;
 
@@ -140,8 +137,8 @@ public class Store {
         }
         SQLiteConfig config = new SQLiteConfig();
         config.setJournalMode(SQLiteConfig.JournalMode.WAL);
-        // NORMAL in WAL mode can lose the last commits on power loss but never
-        // corrupts the file, and is what makes a commit cost microseconds.
+        // In WAL mode, NORMAL skips the fsync per commit: a power loss can drop
+        // the last commits but does not corrupt the file.
         config.setSynchronous(SQLiteConfig.SynchronousMode.NORMAL);
         config.enforceForeignKeys(true);
         config.setBusyTimeout(5000);
@@ -202,9 +199,8 @@ public class Store {
         });
     }
 
-    void executorReleased(
-            String job, int number, String node, int executor, long at,
-            String outcome, long durationMs, String problem) throws SQLException {
+    void executorReleased(String job, int number, String node, int executor, long at, String outcome, String problem)
+            throws SQLException {
         write(c -> {
             Long allocation = queryLong(c, """
                     SELECT a.id FROM allocations a
@@ -220,39 +216,30 @@ public class Store {
                 return 0;
             }
             long seq = nextSeq(c);
-            execute(c, "UPDATE allocations SET released_at = ?, released_seq = ?, outcome = ?,"
-                    + " duration_ms = ?, problem = ? WHERE id = ?",
-                    at, seq, outcome, durationMs, problem, allocation);
+            execute(c, "UPDATE allocations SET released_at = ?, released_seq = ?, outcome = ?, problem = ?"
+                    + " WHERE id = ?", at, seq, outcome, problem, allocation);
             return seq;
         });
     }
 
-    /**
-     * Follows a job, or a folder and everything in it, to a new full name. The
-     * listener fires for a moved folder and then for each item inside it; the
-     * second pass finds nothing left to move, so either order works.
-     */
+    /** Follows a job to a new full name. Jenkins reports each item inside a moved folder separately. */
     void itemMoved(String from, String to, long at) throws SQLException {
         write(c -> {
             String id = queryString(c, "SELECT id FROM jobs WHERE full_name = ? AND deleted_at IS NULL", from);
             if (id != null) {
-                // A live row already holding the new name is stale: Jenkins says
-                // this job owns it now.
+                // A live row already holding the new name is stale.
                 execute(c, "UPDATE jobs SET deleted_at = ? WHERE full_name = ? AND deleted_at IS NULL AND id <> ?",
                         at, to, id);
                 execute(c, "UPDATE jobs SET full_name = ? WHERE id = ?", to, id);
             }
-            execute(c, "UPDATE jobs SET full_name = ? || substr(full_name, length(?) + 1)"
-                    + " WHERE instr(full_name, ?) = 1 AND deleted_at IS NULL", to, from, from + "/");
             return 0;
         });
     }
 
-    /** Marks a job, or a folder and everything in it, as gone. History stays. */
+    /** Marks a job as gone; history stays. Jenkins deletes a folder's contents one item at a time. */
     void itemDeleted(String fullName, long at) throws SQLException {
         write(c -> {
-            execute(c, "UPDATE jobs SET deleted_at = ? WHERE (full_name = ? OR instr(full_name, ?) = 1)"
-                    + " AND deleted_at IS NULL", at, fullName, fullName + "/");
+            execute(c, "UPDATE jobs SET deleted_at = ? WHERE full_name = ? AND deleted_at IS NULL", at, fullName);
             return 0;
         });
     }
@@ -277,9 +264,8 @@ public class Store {
     }
 
     /**
-     * Deletes builds, and with them their allocations, that finished before
-     * {@code cutoff}. Jobs and nodes are kept: they are small, and their ids
-     * are what keeps later history attributable.
+     * Deletes builds that finished before {@code cutoff}, and their
+     * allocations. Jobs and nodes are kept.
      */
     int prune(long cutoff) throws SQLException {
         int[] deleted = new int[1];
@@ -416,20 +402,17 @@ public class Store {
 
     /** The live row's id for {@code name}, minting one on first sight. */
     private static String mintedId(Connection c, String table, String column, String name) throws SQLException {
-        String id = queryString(c, "SELECT id FROM " + table + " WHERE " + column + " = ? AND deleted_at IS NULL", name);
-        if (id == null) {
-            id = UUID.randomUUID().toString();
-            execute(c, "INSERT INTO " + table + " (id, " + column + ") VALUES (?, ?)", id, name);
-        }
-        return id;
+        return queryString(c, "INSERT INTO " + table + " (id, " + column + ") VALUES (?, ?)"
+                + " ON CONFLICT (" + column + ") WHERE deleted_at IS NULL"
+                + " DO UPDATE SET " + column + " = excluded." + column + " RETURNING id",
+                UUID.randomUUID().toString(), name);
     }
 
     private static long buildId(Connection c, String jobId, int number) throws SQLException {
         // Created by whichever arrives first: a freestyle build's executor is
         // taken before the build is reported as started.
-        execute(c, "INSERT INTO builds (job_id, number) VALUES (?, ?) ON CONFLICT (job_id, number) DO NOTHING",
-                jobId, number);
-        return queryLong(c, "SELECT id FROM builds WHERE job_id = ? AND number = ?", jobId, number);
+        return queryLong(c, "INSERT INTO builds (job_id, number) VALUES (?, ?)"
+                + " ON CONFLICT (job_id, number) DO UPDATE SET number = excluded.number RETURNING id", jobId, number);
     }
 
     private static int execute(Connection c, String sql, Object... args) throws SQLException {

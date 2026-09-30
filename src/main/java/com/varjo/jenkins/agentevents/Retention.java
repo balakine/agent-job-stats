@@ -11,8 +11,7 @@ import java.util.logging.Logger;
  * Deletes builds, and their allocations, older than a configured age.
  *
  * <p>Off unless {@code -Dcom.varjo.jenkins.agentevents.Store.retentionDays=N}
- * is set: at a few hundred bytes a row, most instances can keep everything.
- * Read on every run, so it can be changed without a restart.
+ * is set. Read on every run, so it can be changed without a restart.
  */
 @Extension
 public class Retention extends PeriodicWork {

@@ -2,12 +2,11 @@
 
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
--- The epoch names this database's numbering. It changes only if the file is
--- recreated, which is the one way a cursor can stop meaning anything.
+-- Identifies this database's sequence numbering.
 INSERT INTO meta (key, value) VALUES ('epoch', lower(hex(randomblob(16))));
 
--- One row: the last sequence number handed out. Stored rather than derived from
--- the maximum in use, so pruning old rows can never make a number be issued twice.
+-- One row: the last sequence number issued. Kept separately from the rows that
+-- use the numbers, so pruning cannot cause a number to be issued again.
 CREATE TABLE sequence (last INTEGER NOT NULL);
 INSERT INTO sequence (last) VALUES (0);
 

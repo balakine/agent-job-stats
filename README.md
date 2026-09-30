@@ -51,12 +51,12 @@ Properties, all optional except `seq`, `event` and `at`:
 | `url` | path to the build, relative to the Jenkins root; absent once the job is deleted |
 | `build` | build number |
 | `status` | the build's result, on `build_ended` only |
-| `node` | agent the executor belongs to, as it is named now; `built-in` for Jenkins itself |
+| `node` | agent the executor belongs to, as it is named now; `built-in` for Jenkins itself (`master` on installs never migrated) |
 | `node_id` | the agent's stable id |
 | `executor` | executor number on that node |
 | `task` | what the executor is working on, as Jenkins names it |
 | `outcome` | `completed` or `problems`, on `executor_released` |
-| `duration_ms` | how long the executor held the work |
+| `duration_ms` | how long the executor held the work: release time minus the executor's own start time, which is how Jenkins measures it |
 | `problem` | the failure Jenkins reported, when there was one |
 | `node_hidden` | set when the agent was withheld for lack of permission |
 
@@ -68,8 +68,8 @@ build from before a rename shows the job under its new name and `url`. `job_id`
 and `node_id` are what to key on.
 
 `node` is the agent's own name, so it matches what you would write in
-`node('lab-agent')`; Jenkins's built-in node has no name and reports as
-`built-in`.
+`node('lab-agent')`. Jenkins's built-in node has no name of its own and reports
+as its label, `built-in`.
 
 ## What `outcome` means, and what it does not
 
@@ -125,7 +125,7 @@ in-memory copy of events: the stream reads the same rows the listeners write.
 | `jobs` | job ever seen: `id` (UUID), current `full_name`, `deleted_at` |
 | `nodes` | static agent ever seen: `id` (UUID), current `name`, `deleted_at` |
 | `builds` | build: job, number, start and end times, result |
-| `allocations` | executor a build occupied: node, executor number, task, allocation and release times, outcome, duration, problem |
+| `allocations` | executor a build occupied: node, executor number, task, allocation and release times, outcome, problem |
 | `meta`, `sequence` | epoch, last sequence number issued |
 
 An event is not stored twice. Each row carries the sequence numbers of the
@@ -137,7 +137,9 @@ query over those columns.
 seen and kept through:
 
 * a job rename or move between folders, including everything inside a renamed
-  or moved folder (`ItemListener.onLocationChanged`)
+  or moved folder: Jenkins reports each of those items itself
+  (`ItemListener.onLocationChanged`), as it deletes a folder's contents one item
+  at a time
 * an agent rename (`NodeListener.onUpdated`)
 
 Deleting a job or agent marks it `deleted_at` and keeps its history. If a new

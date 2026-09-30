@@ -14,75 +14,67 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Records an executor taking up work and handing it back.
- *
- * <p>Everything recorded here comes from {@link ExecutorListener} itself, which
- * knows nothing about what kind of job it is serving. That keeps one meaning for
- * every allocation whatever ran: a Pipeline {@code node} block, a freestyle
- * build, a matrix configuration. Whether the build passed is a separate
- * question, answered by the build's own result.
- *
- * <p>Only static agents are tracked. A cloud agent exists for one build under a
- * generated name, so giving it a stable identity would mean nothing.
+ * Records an executor taking up work and handing it back, for any kind of task.
+ * The outcome is the executor's, as {@link ExecutorListener} reports it, not the
+ * build's result.
  */
 @Extension
 public class ExecutorEvents implements ExecutorListener {
 
     private static final Logger LOGGER = Logger.getLogger(ExecutorEvents.class.getName());
 
-    /** Node name recorded for Jenkins's own built-in node, which has none. */
-    static final String BUILT_IN = "built-in";
+    private static final String COMPLETED = "completed";
 
-    /** The two outcomes {@link ExecutorListener} distinguishes, and no more. */
-    static final String COMPLETED = "completed";
+    private static final String PROBLEMS = "problems";
 
-    static final String PROBLEMS = "problems";
-
-    /** Keeps a stray exception message from bloating the row. */
     private static final int PROBLEM_LIMIT = 300;
 
     /**
-     * Recorded from {@code taskStarted} rather than {@code taskAccepted}: the
-     * two are microseconds apart, but only once the task has started is the
-     * executable - and through it the build the executor works for - knowable.
+     * The executable, and through it the build, is set by {@code taskStarted}.
+     * The time recorded is the executor's start time, which Jenkins measures
+     * the task's duration from.
      */
     @Override
     public void taskStarted(Executor executor, Queue.Task task) {
-        Run<?, ?> run = trackedRun(executor);
+        Node node = executor.getOwner().getNode();
+        Run<?, ?> run = trackedRun(executor, node);
         if (run == null) {
             return;
         }
+        String name = node.getSelfLabel().getName();
         try {
-            Store.get().executorAllocated(run.getParent().getFullName(), run.getNumber(), nodeName(executor),
-                    executor.getNumber(), task.getDisplayName(), System.currentTimeMillis());
+            Store.get().executorAllocated(run.getParent().getFullName(), run.getNumber(), name,
+                    executor.getNumber(), task.getDisplayName(), System.currentTimeMillis() - executor.getElapsedTime());
         } catch (SQLException | RuntimeException e) {
-            // A monitoring plugin must never fail the build it is watching.
-            LOGGER.log(Level.WARNING, "could not record an allocation on " + nodeName(executor), e);
+            // A recording failure must not fail the build.
+            LOGGER.log(Level.WARNING, "could not record an allocation on " + name, e);
         }
     }
 
     @Override
     public void taskCompleted(Executor executor, Queue.Task task, long durationMs) {
-        released(executor, durationMs, COMPLETED, null);
+        released(executor, COMPLETED, null);
     }
 
     @Override
     public void taskCompletedWithProblems(
             Executor executor, Queue.Task task, long durationMs, Throwable problems) {
-        released(executor, durationMs, PROBLEMS, problems);
+        released(executor, PROBLEMS, problems);
     }
 
-    private void released(Executor executor, long durationMs, String outcome, Throwable problems) {
-        Run<?, ?> run = trackedRun(executor);
+    private void released(Executor executor, String outcome, Throwable problems) {
+        Node node = executor.getOwner().getNode();
+        Run<?, ?> run = trackedRun(executor, node);
         if (run == null) {
             return;
         }
+        String name = node.getSelfLabel().getName();
         try {
-            Store.get().executorReleased(run.getParent().getFullName(), run.getNumber(), nodeName(executor),
-                    executor.getNumber(), System.currentTimeMillis(), outcome, durationMs,
+            Store.get().executorReleased(run.getParent().getFullName(), run.getNumber(), name,
+                    executor.getNumber(), System.currentTimeMillis(), outcome,
                     problems == null ? null : summarize(problems));
         } catch (SQLException | RuntimeException e) {
-            LOGGER.log(Level.WARNING, "could not record a release on " + nodeName(executor), e);
+            LOGGER.log(Level.WARNING, "could not record a release on " + name, e);
         }
     }
 
@@ -91,45 +83,23 @@ public class ExecutorEvents implements ExecutorListener {
      * tracked: a flyweight executor, an ephemeral agent, or work that belongs to
      * no build.
      *
-     * <p>A flyweight executor is where a Pipeline's own task sits while it waits
-     * on its {@code node} blocks; it occupies no agent capacity and lives as
-     * long as the build, which {@link BuildEvents} already records.
+     * <p>A flyweight executor holds a Pipeline's own task for the whole build
+     * and occupies no agent capacity.
      */
-    private static Run<?, ?> trackedRun(Executor executor) {
-        if (executor instanceof OneOffExecutor) {
+    private static Run<?, ?> trackedRun(Executor executor, Node node) {
+        if (executor instanceof OneOffExecutor
+                || node == null
+                || node instanceof EphemeralNode
+                || node instanceof AbstractCloudSlave) {
             return null;
         }
-        Node node = executor.getOwner().getNode();
-        if (node == null || node instanceof EphemeralNode || node instanceof AbstractCloudSlave) {
-            return null;
+        // A build's own executable, or a part of one such as a Pipeline node
+        // block's placeholder, whose parent is the build.
+        Queue.Executable executable = executor.getCurrentExecutable();
+        if (executable instanceof Run<?, ?> run) {
+            return run;
         }
-        return runOf(executor.getCurrentExecutable());
-    }
-
-    /**
-     * Walks up from an executable to the build it belongs to. Some executables
-     * are nested inside another - a Pipeline {@code node} block's placeholder
-     * belongs to the build running elsewhere - so the build can be a step or two
-     * above. The bound only guards against a cycle.
-     */
-    private static Run<?, ?> runOf(Queue.Executable executable) {
-        Queue.Executable current = executable;
-        for (int guard = 0; current != null && guard < 10; guard++) {
-            if (current instanceof Run) {
-                return (Run<?, ?>) current;
-            }
-            Queue.Executable parent = current.getParentExecutable();
-            if (parent == current) {
-                break;
-            }
-            current = parent;
-        }
-        return null;
-    }
-
-    static String nodeName(Executor executor) {
-        String name = executor.getOwner().getName();
-        return name == null || name.isEmpty() ? BUILT_IN : name;
+        return executable != null && executable.getParentExecutable() instanceof Run<?, ?> run ? run : null;
     }
 
     private static String summarize(Throwable problems) {

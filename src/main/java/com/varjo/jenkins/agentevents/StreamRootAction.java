@@ -27,24 +27,19 @@ import org.kohsuke.stapler.StaplerResponse2;
  * </pre>
  *
  * <p>One JSON object per line, each an event with its {@code seq}. Blank lines
- * are keepalives. A {@code {"type":"gap"}} line says the requested sequence is
- * no longer stored, so the reader knows its record is incomplete instead of
- * quietly missing events.
+ * are keepalives. A {@code {"type":"gap"}} line says some requested events are
+ * not stored: they were pruned, or the cursor is from a recreated database.
  *
- * <p>Events are read back from the database, so a reader that falls behind is
- * simply behind: it catches up from where it is, and nothing is buffered for it.
- *
- * <p>NDJSON rather than a framed format because a reader needs only a line and
- * a JSON parse, and because the filtering below has to happen per reader: what
- * one may see depends on their permissions, so the same event renders
- * differently for different callers and cannot be broadcast.
+ * <p>Each stream reads the database from its own cursor, so a slow reader
+ * catches up from where it is and nothing is buffered for it. Events are
+ * filtered by the reader's own permissions.
  */
 @Extension
 public class StreamRootAction implements RootAction {
 
     private static final Logger LOGGER = Logger.getLogger(StreamRootAction.class.getName());
 
-    /** Kept short so a proxy or a dead peer is noticed without waiting long. */
+    /** Short enough to keep proxies from timing out an idle stream, and to detect a dead peer. */
     private static final long KEEPALIVE_SECONDS = 15;
 
     /** Rows read per query while catching up. */
@@ -73,15 +68,14 @@ public class StreamRootAction implements RootAction {
         long since = parseSince(req.getParameter("since"));
         rsp.setContentType("application/x-ndjson;charset=UTF-8");
         rsp.setHeader("Cache-Control", "no-cache, no-store");
-        // nginx buffers proxied responses by default, which would hold events
-        // back until the connection closed. This header turns that off for this
-        // response alone, so the stream needs no proxy configuration of its own.
+        // Turns off nginx's proxy buffering for this response, which would
+        // otherwise hold events back until the connection closed.
         rsp.setHeader("X-Accel-Buffering", "no");
 
         Store store = Store.get();
         String user = Jenkins.getAuthentication2().getName();
-        // Deleted jobs and agents can no longer be asked who may see them, so
-        // their history is shown only to administrators.
+        // Permissions on deleted jobs and agents cannot be checked; their events
+        // go to administrators only.
         boolean admin = jenkins.hasPermission(Jenkins.ADMINISTER);
         long openedAt = System.currentTimeMillis();
         long delivered = 0;
@@ -91,14 +85,12 @@ public class StreamRootAction implements RootAction {
             long oldest = store.oldestSeq(db);
             long latest = store.latestSeq();
             write(out, hello(store.epoch(), oldest, latest));
-            // Asking whether the endpoint exists is not a connection: nothing
-            // follows the greeting, and nothing is logged.
+            // A probe gets the hello line only, and is not logged.
             if (probe) {
                 return;
             }
 
-            // A cursor past the end belongs to a numbering that no longer
-            // exists, which happens when the database is recreated.
+            // A cursor past the end is from a recreated database.
             boolean reset = since > latest;
             if (reset || (since > 0 && oldest > since + 1)) {
                 JSONObject gap = new JSONObject();
@@ -111,9 +103,7 @@ public class StreamRootAction implements RootAction {
                 since = 0;
             }
 
-            // At FINE because a client reconnects on every network blip and the
-            // system log is read at INFO; enable this class in Manage Jenkins >
-            // System Log to follow clients.
+            // FINE: clients reconnect after every network interruption.
             LOGGER.log(Level.FINE, "stream opened for {0} (since={1})", new Object[] {user, since});
 
             long cursor = since;
@@ -131,8 +121,8 @@ public class StreamRootAction implements RootAction {
                     continue;
                 }
                 if (!store.awaitNewer(cursor, KEEPALIVE_SECONDS, TimeUnit.SECONDS)) {
-                    // A blank line is the keepalive: one byte, proves the
-                    // connection both ways, and a reader skips it for free.
+                    // Keepalive: a blank line, which readers skip. Writing it
+                    // is also what detects a dead peer.
                     write(out, "\n");
                 }
             }
@@ -141,7 +131,7 @@ public class StreamRootAction implements RootAction {
         } catch (SQLException e) {
             LOGGER.log(Level.WARNING, "stream for " + user + " failed reading the event store", e);
         } catch (IOException e) {
-            // The reader hung up. Nothing to report: that is how streams end.
+            // The client disconnected: the normal end of a stream.
         } finally {
             if (!probe) {
                 LOGGER.log(Level.FINE, "stream closed for {0} after {1}s, {2} events sent",
@@ -207,8 +197,7 @@ public class StreamRootAction implements RootAction {
             json.put("status", row.result());
         }
         if (row.nodeName() != null) {
-            // Which agent ran the work is a fact about the agent, not only about
-            // the job, so it takes a permission on the agent.
+            // Agent details need permission on the agent as well as the job.
             if (canSeeAgent(row.nodeName(), row.nodeDeleted(), admin)) {
                 json.put("node", row.nodeName());
                 json.put("node_id", row.nodeId());
@@ -231,22 +220,17 @@ public class StreamRootAction implements RootAction {
     }
 
     /**
-     * Whether the caller may know this agent by name, by
-     * {@code Computer.EXTENDED_READ} on it.
-     *
-     * <p>Jenkins core has no per-agent read permission - {@code Computer}
-     * defines CONFIGURE, EXTENDED_READ, DELETE, CREATE, DISCONNECT, CONNECT and
-     * BUILD, and nothing finer - so EXTENDED_READ is the closest thing to "may
-     * see this agent's details". An agent that no longer exists cannot be
-     * checked, so only administrators see it: failing closed is the only safe
-     * way to be wrong about a permission.
+     * Whether the caller has {@code Computer.EXTENDED_READ} on this agent, the
+     * narrowest permission Jenkins defines for reading an agent's details. A
+     * deleted agent cannot be checked and is visible to administrators only.
      */
     private static boolean canSeeAgent(String node, boolean deleted, boolean admin) {
         if (deleted) {
             return admin;
         }
         Jenkins jenkins = Jenkins.get();
-        Computer computer = ExecutorEvents.BUILT_IN.equals(node)
+        // Nodes are recorded by their self label, which for Jenkins itself is not its computer name.
+        Computer computer = node.equals(jenkins.getSelfLabel().getName())
                 ? jenkins.toComputer()
                 : jenkins.getComputer(node);
         return computer != null && computer.hasPermission(Computer.EXTENDED_READ);
